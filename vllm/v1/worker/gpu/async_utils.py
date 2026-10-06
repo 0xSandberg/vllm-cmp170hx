@@ -122,6 +122,8 @@ class AsyncOutput(AsyncModelRunnerOutput):
         copy_stream: torch.cuda.Stream,
         check_ep_fault: bool,
         pending_aux_output: "PendingAuxOutput | None",
+        failed_tokens: torch.Tensor | None = None,
+        query_start_loc_np: np.ndarray | None = None,
     ):
         # NOTE(woosuk): We must retain references to the GPU tensors,
         # as the copy operations are performed on a different CUDA stream than
@@ -130,6 +132,7 @@ class AsyncOutput(AsyncModelRunnerOutput):
         self.sampler_output = sampler_output
         self.num_sampled_tokens = num_sampled_tokens
         self.pending_aux_output = pending_aux_output
+        self.query_start_loc_np = query_start_loc_np
         # Blocking (sleep) event to avoid busy-polling the CUDA driver lock.
         self.copy_event = torch.cuda.Event(blocking=True)
         self._has_fault: torch.Tensor | None = None
@@ -165,6 +168,9 @@ class AsyncOutput(AsyncModelRunnerOutput):
                     num_sampled=self.num_sampled_tokens_np,
                     num_rejected=async_copy_to_np(sampler_output.num_rejected),
                 )
+            self.failed_tokens: np.ndarray | None = None
+            if failed_tokens is not None:
+                self.failed_tokens = async_copy_to_np(failed_tokens)
             if check_ep_fault:
                 has_fault = get_ep_all2all_manager().query_fault()
                 self._has_fault = has_fault.to("cpu", non_blocking=True)
@@ -205,6 +211,16 @@ class AsyncOutput(AsyncModelRunnerOutput):
             self.model_runner_output.aux_output_connector_output = (
                 self.pending_aux_output.process_output()
             )
+
+        if self.failed_tokens is not None:
+            assert self.query_start_loc_np is not None
+            failed = failed_request_ids(
+                self.failed_tokens,
+                self.query_start_loc_np,
+                self.model_runner_output.req_ids,
+            )
+            if failed:
+                self.model_runner_output.failed_req_ids = failed
 
         if self._has_fault is not None and self._has_fault.item():
             mask = get_ep_all2all_manager().query_active_mask()
@@ -259,6 +275,21 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         self.copy_event.synchronize()
         self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
+
+
+def failed_request_ids(
+    failed_tokens: np.ndarray, query_start_loc: np.ndarray, req_ids: list[str]
+) -> set[str]:
+    """Map a per-token failure mask to the requests owning those tokens.
+
+    Tokens past the last request (padding) belong to no request.
+    """
+    num_reqs = len(req_ids)
+    tokens = np.flatnonzero(failed_tokens[: query_start_loc[num_reqs]])
+    if tokens.size == 0:
+        return set()
+    owners = np.searchsorted(query_start_loc[1 : num_reqs + 1], tokens, side="right")
+    return {req_ids[i] for i in np.unique(owners).tolist()}
 
 
 def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
