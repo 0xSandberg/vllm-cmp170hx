@@ -10,6 +10,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.v1.failed_inputs import failed_request_ids
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     LogprobsTensors,
@@ -275,21 +276,6 @@ class AsyncPoolingOutput(AsyncModelRunnerOutput):
         self.copy_event.synchronize()
         self.model_runner_output.pooler_output = pooler_output
         return self.model_runner_output
-
-
-def failed_request_ids(
-    failed_tokens: np.ndarray, query_start_loc: np.ndarray, req_ids: list[str]
-) -> set[str]:
-    """Map a per-token failure mask to the requests owning those tokens.
-
-    Tokens past the last request (padding) belong to no request.
-    """
-    num_reqs = len(req_ids)
-    tokens = np.flatnonzero(failed_tokens[: query_start_loc[num_reqs]])
-    if tokens.size == 0:
-        return set()
-    owners = np.searchsorted(query_start_loc[1 : num_reqs + 1], tokens, side="right")
-    return {req_ids[i] for i in np.unique(owners).tolist()}
 
 
 def async_copy_to_np(x: torch.Tensor) -> np.ndarray:
